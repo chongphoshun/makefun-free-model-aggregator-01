@@ -2012,7 +2012,194 @@ def poll_work(server, done_event):
         done_event.wait(POLL_INTERVAL_S)
 
 
+# ---------------------------------------------------------------------------
+# self-test
+#
+# `python3 main.py --self-test` exercises the pure translator and routing
+# helpers with synthetic inputs and exits 0 only when every assertion
+# holds.  It runs before load_catalog(), so it needs no brief, no env URL
+# and no network; the trial harness never passes --self-test, so this
+# changes nothing about how the server serves.  Run it after any edit to
+# the translators to catch a drift between the three wires before the
+# practice does: the scorer checks the echo against what the client sent,
+# so a translator that drops a field fails the wire check, not the routing.
+# ---------------------------------------------------------------------------
+
+
+def self_test():
+    """Smoke-test the pure helpers. Returns (failures, total)."""
+    failures = []
+    total = [0]
+
+    def check(name, cond):
+        total[0] += 1
+        if not cond:
+            failures.append(name)
+            print("FAIL: %s" % name)
+
+    # --- stop/finish reason mapping (both directions, every branch) ---
+    check("stop length", stop_reason_of("length") == "max_tokens")
+    check("stop tool_calls", stop_reason_of("tool_calls") == "tool_use")
+    check("stop function_call", stop_reason_of("function_call") == "tool_use")
+    check("stop content_filter", stop_reason_of("content_filter") == "refusal")
+    check("stop other", stop_reason_of("stop") == "end_turn")
+    check("finish max_tokens", finish_reason_of("max_tokens") == "length")
+    check("finish MAX_TOKENS", finish_reason_of("MAX_TOKENS") == "length")
+    check("finish tool_use", finish_reason_of("tool_use") == "tool_calls")
+    check("finish refusal", finish_reason_of("refusal") == "content_filter")
+    check("finish SAFETY", finish_reason_of("SAFETY") == "content_filter")
+    check("finish end_turn", finish_reason_of("end_turn") == "stop")
+    # round-trip: every Anthropic stop reason survives to OpenAI and back
+    for stop in ("end_turn", "max_tokens", "tool_use", "refusal"):
+        check("round-trip " + stop, stop_reason_of(finish_reason_of(stop)) == stop)
+
+    # --- error shapes (the client libraries parse these exactly) ---
+    check("openai error default",
+          openai_error("bad") == {"error": {"message": "bad",
+                                            "type": "invalid_request_error",
+                                            "code": None}})
+    check("openai error custom",
+          openai_error("bad", "auth", "E1")["error"]["type"] == "auth")
+    check("anthropic error",
+          anthropic_error("invalid_request_error", "bad")
+          == {"type": "error",
+              "error": {"type": "invalid_request_error", "message": "bad"}})
+
+    # --- URL joining and auth headers (the probe path depends on these) ---
+    check("join absolute base",
+          join_base("https://env.example.com", "https://api.x.com/v2") == "https://api.x.com/v2")
+    check("join relative base",
+          join_base("https://env.example.com", "/v1") == "https://env.example.com/v1")
+    check("join bare base",
+          join_base("https://env.example.com", "v1") == "https://env.example.com/v1")
+    check("join empty base",
+          join_base("https://env.example.com", "") == "https://env.example.com")
+    check("join trailing slash",
+          join_base("https://env.example.com/", "/v1") == "https://env.example.com/v1")
+    check("auth bearer", auth_headers("bearer", "k") == {"authorization": "Bearer k"})
+    check("auth x-api-key", auth_headers("x-api-key", "k") == {"x-api-key": "k"})
+    check("auth x-goog", auth_headers("x-goog-api-key", "k") == {"x-goog-api-key": "k"})
+    check("auth no key", auth_headers("bearer", "") == {})
+    check("auth unknown scheme", auth_headers("basic", "k") == {})
+
+    # --- http_request refuses non-HTTP(S) URLs instead of misrouting them ---
+    check("http ftp refused", http_request("GET", "ftp://x.com/") == (0, {}, b""))
+    check("http no scheme refused", http_request("GET", "example.com/") == (0, {}, b""))
+    check("http no host refused", http_request("GET", "https:///path") == (0, {}, b""))
+
+    # --- routing predicates: the quality table wins, the probe is fallback ---
+    check("model_free probe true", model_free({"free": True}, None) is True)
+    check("model_free probe false", model_free({"free": False}, None) is False)
+    check("model_free row wins true", model_free({"free": False}, {"free": True}) is True)
+    check("model_free row wins false", model_free({"free": True}, {"free": False}) is False)
+    caps = {"tools": True, "vision": False, "json": True, "context_length": 8000}
+    check("meets tools", meets_requirements({"tools": True}, caps) is True)
+    check("meets vision fails", meets_requirements({"vision": True}, caps) is False)
+    check("meets json", meets_requirements({"json": True}, caps) is True)
+    check("meets min_context ok",
+          meets_requirements({"min_context": 8000}, caps) is True)
+    check("meets min_context fails",
+          meets_requirements({"min_context": 8001}, caps) is False)
+    check("meets empty", meets_requirements({}, caps) is True)
+
+    # --- Anthropic -> OpenAI: text, tool_use, tool_result, image ---
+    out = anthropic_to_openai(
+        {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 10}, "m")
+    check("a2o text", out["messages"] == [{"role": "user", "content": "hi"}])
+    check("a2o max_tokens", out["max_tokens"] == 10)
+    check("a2o model", out["model"] == "m")
+    out = anthropic_to_openai(
+        {"messages": [{"role": "assistant", "content": [
+            {"type": "text", "text": "calling"},
+            {"type": "tool_use", "id": "t1", "name": "get_weather",
+             "input": {"city": "Paris"}}]}]}, "m")
+    msg = out["messages"][0]
+    check("a2o tool text", msg["content"] == "calling")
+    check("a2o tool_calls",
+          msg["tool_calls"] == [{"id": "t1", "type": "function",
+                                 "function": {"name": "get_weather",
+                                            "arguments": '{"city":"Paris"}'}}])
+    out = anthropic_to_openai(
+        {"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1",
+             "content": "sunny"}]}]}, "m")
+    check("a2o tool_result",
+          out["messages"] == [{"role": "tool", "tool_call_id": "t1", "content": "sunny"}])
+    out = anthropic_to_openai(
+        {"messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "url",
+                                         "url": "https://x.com/i.png"}}]}]}, "m")
+    check("a2o image",
+          out["messages"][0]["content"]
+          == [{"type": "image_url", "image_url": {"url": "https://x.com/i.png"}}])
+    out = anthropic_to_openai(
+        {"system": "be brief", "messages": [{"role": "user", "content": "hi"}],
+         "stream": True}, "m")
+    check("a2o system",
+          out["messages"][0] == {"role": "system", "content": "be brief"})
+    check("a2o stream", out.get("stream") is True
+          and out.get("stream_options") == {"include_usage": True})
+
+    # --- OpenAI -> Anthropic: text, tool_calls, tool role, system, image ---
+    out = openai_to_anthropic(
+        {"messages": [{"role": "user", "content": "hi"}]}, "m")
+    check("o2a text",
+          out["messages"] == [{"role": "user",
+                               "content": [{"type": "text", "text": "hi"}]}])
+    out = openai_to_anthropic(
+        {"messages": [{"role": "assistant", "content": "calling",
+                       "tool_calls": [{"id": "t1", "type": "function",
+                                      "function": {"name": "get_weather",
+                                                 "arguments": '{"city": "Paris"}'}}]}]},
+        "m")
+    blocks = out["messages"][0]["content"]
+    check("o2a tool_use",
+          blocks == [{"type": "text", "text": "calling"},
+                     {"type": "tool_use", "id": "t1", "name": "get_weather",
+                      "input": {"city": "Paris"}}])
+    out = openai_to_anthropic(
+        {"messages": [{"role": "tool", "tool_call_id": "t1", "content": "sunny"}]},
+        "m")
+    check("o2a tool role",
+          out["messages"] == [{"role": "user",
+                               "content": [{"type": "tool_result",
+                                            "tool_use_id": "t1",
+                                            "content": "sunny"}]}])
+    out = openai_to_anthropic(
+        {"messages": [{"role": "system", "content": "be brief"},
+                      {"role": "system", "content": "and kind"},
+                      {"role": "user", "content": "hi"}]}, "m")
+    check("o2a system joined", out["system"] == "be brief\nand kind")
+    out = openai_to_anthropic(
+        {"messages": [{"role": "user", "content": [
+            {"type": "image_url",
+             "image_url": {"url": "https://x.com/i.png"}}]}]}, "m")
+    check("o2a image",
+          out["messages"][0]["content"]
+          == [{"type": "image",
+               "source": {"type": "url", "url": "https://x.com/i.png"}}])
+
+    # --- image helpers: data URLs round-trip, plain URLs stay URLs ---
+    part = openai_image_block("data:image/png;base64,AAAA")
+    check("image data url",
+          part == {"type": "image",
+                   "source": {"type": "base64", "media_type": "image/png",
+                              "data": "AAAA"}})
+    check("image gemini data",
+          gemini_image_part("data:image/png;base64,AAAA")
+          == {"inlineData": {"mimeType": "image/png", "data": "AAAA"}})
+    check("image gemini url",
+          gemini_image_part("https://x.com/i.png")
+          == {"fileData": {"fileUri": "https://x.com/i.png"}})
+
+    print("self-test: %d/%d passed" % (total[0] - len(failures), total[0]))
+    return len(failures), total[0]
+
+
 def main():
+    if "--self-test" in sys.argv[1:]:
+        failures, _total = self_test()
+        return 1 if failures else 0
     load_catalog()
     if "--list" in sys.argv[1:]:
         sys.stdout.write(json_compact(CATALOG) + "\n")
