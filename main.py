@@ -314,6 +314,8 @@ def auth_headers(auth, key):
 def http_request(method, url, headers=None, body=None, timeout=PROBE_TIMEOUT_S):
     """One HTTP call. Returns (status, headers_dict, body_bytes) or (0, {}, b'')."""
     parts = urllib.parse.urlparse(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return 0, {}, b""
     host = parts.hostname or ""
     port = parts.port or (443 if parts.scheme == "https" else 80)
     path = parts.path or "/"
