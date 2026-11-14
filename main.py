@@ -2192,6 +2192,102 @@ def self_test():
           gemini_image_part("https://x.com/i.png")
           == {"fileData": {"fileUri": "https://x.com/i.png"}})
 
+    # --- small value helpers: the translators lean on these everywhere ---
+    check("is_record dict", is_record({}) is True)
+    check("is_record list", is_record([]) is False)
+    check("is_record None", is_record(None) is False)
+    check("str_of str", str_of("x") == "x")
+    check("str_of int", str_of(3) == "")
+    check("str_of None", str_of(None) == "")
+    check("num_or_none int", num_or_none(5) == 5)
+    check("num_or_none float", num_or_none(2.5) == 2.5)
+    check("num_or_none str", num_or_none("5") is None)
+    check("num_or_none nan", num_or_none(float("nan")) is None)
+    check("num_or_none inf", num_or_none(float("inf")) is None)
+    check("num_or_zero int", num_or_zero(5) == 5)
+    check("num_or_zero nan", num_or_zero(float("nan")) == 0)
+    check("num_or_zero str", num_or_zero("5") == 0)
+    check("bool_or_none true", bool_or_none(True) is True)
+    check("bool_or_none false", bool_or_none(False) is False)
+    check("bool_or_none int", bool_or_none(1) is None)
+    check("json_compact", json_compact({"a": 1}) == '{"a":1}')
+    check("json_compact unicode", json_compact({"a": "é"}) == '{"a":"é"}')
+    check("safe_json_loads ok", safe_json_loads('{"a": 1}') == {"a": 1})
+    check("safe_json_loads bad", safe_json_loads("not json") is None)
+    check("safe_json_loads empty", safe_json_loads("") is None)
+    check("text_of str", text_of("hi") == "hi")
+    check("text_of blocks",
+          text_of([{"type": "text", "text": "a"}, {"type": "text", "text": "b"},
+                   {"type": "image", "source": {}}]) == "a\nb")
+    check("text_of non-text", text_of([{"type": "image"}]) == "")
+    check("text_of None", text_of(None) == "")
+    check("text_of int", text_of(3) == "")
+    check("string_list str", string_list("x") == ["x"])
+    check("string_list mixed", string_list(["a", 1, "b", None]) == ["a", "b"])
+    check("string_list None", string_list(None) == [])
+    check("args_of dict", args_of({"a": 1}) == {"a": 1})
+    check("args_of json str", args_of('{"a": 1}') == {"a": 1})
+    check("args_of bad str", args_of("nope") == {})
+    check("args_of empty str", args_of("  ") == {})
+    check("args_of None", args_of(None) == {})
+    check("parse_data_url png",
+          parse_data_url("data:image/png;base64,AAAA") == ("image/png", "AAAA"))
+    check("parse_data_url no mime",
+          parse_data_url("data:;base64,AAAA") == ("image/png", "AAAA"))
+    check("parse_data_url plain", parse_data_url("https://x.com/i.png") == (None, None))
+    check("parse_data_url empty", parse_data_url("") == (None, None))
+    check("tool_result str", tool_result_text("sunny") == "sunny")
+    check("tool_result blocks",
+          tool_result_text([{"type": "text", "text": "a"}]) == "a")
+    check("tool_result None", tool_result_text(None) == "")
+    check("tool_result int", tool_result_text(7) == "7")
+
+    # --- brace matching and document scanning (the brief parser's core) ---
+    check("object_end simple", object_end('{"a": 1}', 0) == 7)
+    check("object_end nested", object_end('{"a": {"b": 2}}', 0) == 14)
+    check("object_end string brace", object_end('{"a": "}"}', 0) == 9)
+    check("object_end unclosed", object_end('{"a": 1', 0) == -1)
+    check("object_end offset", object_end('xx{"a": 1}yy', 2) == 9)
+    docs = documents_in('hello {"schema": "x", "v": 1} world {"no": 1} '
+                        '{"schema": "y"} end')
+    check("documents_in count", len(docs) == 2)
+    check("documents_in first", docs[0] == {"schema": "x", "v": 1})
+    check("documents_in second", docs[1] == {"schema": "y"})
+    check("documents_in none", documents_in("no objects here") == [])
+    check("documents_in non-string schema",
+          documents_in('{"schema": 5}') == [])
+
+    # --- tool declaration translation (both directions, shape preserved) ---
+    tools = anthropic_tools_to_openai(
+        [{"name": "get_weather",
+          "description": "weather",
+          "input_schema": {"type": "object",
+                           "properties": {"city": {"type": "string"}}}}])
+    check("tools a2o",
+          tools == [{"type": "function",
+                     "function": {"name": "get_weather",
+                                "description": "weather",
+                                "parameters": {"type": "object",
+                                             "properties": {"city": {"type": "string"}}}}}])
+    check("tools a2o empty", anthropic_tools_to_openai(None) == [])
+    check("tools a2o bad", anthropic_tools_to_openai([{"no_name": 1}]) == [])
+    back = openai_tools_to_anthropic(tools)
+    check("tools round-trip",
+          back == [{"name": "get_weather",
+                    "description": "weather",
+                    "input_schema": {"type": "object",
+                                     "properties": {"city": {"type": "string"}}}}])
+    check("tools o2a empty", openai_tools_to_anthropic(None) == [])
+
+    # --- generation config: JSON mode and stop sequences survive ---
+    cfg = gemini_generation_config({"temperature": 0.5, "top_p": 0.9}, 100,
+                                   ["END"], True)
+    check("gemini cfg temp", cfg.get("temperature") == 0.5)
+    check("gemini cfg top_p", cfg.get("topP") == 0.9)
+    check("gemini cfg max_tokens", cfg.get("maxOutputTokens") == 100)
+    check("gemini cfg stops", cfg.get("stopSequences") == ["END"])
+    check("gemini cfg json", cfg.get("responseMimeType") == "application/json")
+
     print("self-test: %d/%d passed" % (total[0] - len(failures), total[0]))
     return len(failures), total[0]
 
