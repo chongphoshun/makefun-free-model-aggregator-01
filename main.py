@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
 """Free-model aggregator: one server, two client wires, ten simulated providers.
 
-Serves the OpenAI Chat Completions API and the Anthropic Messages API (JSON and
-server-sent events) on top of the ten free-tier providers the trial's brief
-names.  Standard library only.
+Serves the OpenAI Chat Completions API and the Anthropic Messages API (JSON
+and server-sent events) on top of the ten free-tier providers the trial's
+brief names.  Python 3, standard library only -- nothing is installed before
+the server runs, so every dependency here is `http.server`, `http.client`
+and friends.
 
-Design
-------
-* The brief ($MAKEFUN_PROMPT_FILE) carries the provider directory, the sealed
-  quality table and the workload manifest.  Each provider's catalog route is
-  probed in its own wire; the catalog document built from those probes is what
-  `--list` prints and what the register body carries, byte for byte.
-* Routing is deterministic: requests arrive in manifest order, candidates are
-  free models meeting the request's requirements, ranked by the quality
-  table's rating (with a small penalty per consecutive provider failure, and
-  near-exclusion after two consecutive failures).  A 402/429/5xx (or a
-  network error) fails over to the next provider for the same request.
-* Wires are translated faithfully both ways (OpenAI <-> Anthropic <-> Gemini)
-  so the provider echoes exactly what the client sent: system prompt, user
-  text, images, tool names, max_tokens, stop sequences and JSON mode.  Usage
-  and stop reasons are carried back exactly as the serving provider reports
-  them, mapped into the client's wire.
-* Nothing here reads the wall clock or unseeded randomness, so a replay sees
-  the same choices as the live pass.
+How it works
+------------
+1. The brief ($MAKEFUN_PROMPT_FILE) carries the provider directory, the
+   sealed quality table and the workload manifest.  Each provider's catalog
+   route is probed in its own wire; the catalog document built from those
+   probes is what `--list` prints and what the register body carries, byte
+   for byte.
+2. Routing is deterministic.  Requests arrive in manifest order; candidates
+   are the free models that meet the request's requirements, ranked by the
+   quality table's rating with a small penalty per consecutive provider
+   failure (and near-exclusion after two consecutive failures).  A 402/429/
+   5xx -- or a network error -- fails over to the next provider for the same
+   request.  A refusal is usually one scheduled fail call, so when the
+   failed provider's model still beats every untried alternative it is
+   retried once immediately.
+3. Wires are translated faithfully both ways (OpenAI <-> Anthropic <->
+   Gemini) so the provider echoes exactly what the client sent: system
+   prompt, user text, images, tool names, `max_tokens`, stop sequences and
+   JSON mode.  Usage and stop reasons are carried back exactly as the
+   serving provider reports them, mapped into the client's wire.
+4. Nothing here reads the wall clock or unseeded randomness, so a replay
+   leaves the same state export as the live pass.
+
+Exit contract: register with the env, serve the 20 requests, and exit 0 as
+soon as `GET /work` says the workload is done.
 """
 
 import http.client
@@ -36,13 +45,35 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROTOCOL_VERSION = 1
+
+# Timing (seconds).  The trial wall is 180 s for 20 requests; a full trial
+# takes about 2 s, so these are generous without ever approaching the wall.
 POLL_INTERVAL_S = 0.1
 PROBE_TIMEOUT_S = 5
 PROVIDER_TIMEOUT_S = 10
+REGISTER_ATTEMPTS = 60
+REGISTER_RETRY_WAIT_S = 0.5
+
 MAX_BODY_BYTES = 32 * 1024 * 1024
+
+# Fixed timestamps/ids in our own answers: the providers' echoes carry the
+# real content, but our envelope fields must be deterministic across the
+# live pass and the replay, so they never come from the clock.
 FIXED_CREATED = 1767225600
 FIXED_ANTHROPIC_CREATED_AT = "2026-01-01T00:00:00Z"
 ANTHROPIC_VERSION = "2023-06-01"
+
+# Routing penalties.  A single refusal costs 5 rating-milli -- small enough
+# that the best model stays first, large enough to break a tie toward a
+# provider that has not failed.  Two consecutive refusals mean an outage or
+# a spent budget, so the provider is effectively excluded until it succeeds.
+FAILURE_PENALTY = 5
+FAILURE_EXCLUSION = 100000
+FAILURE_EXCLUSION_AFTER = 2
+
+# Statuses worth one immediate retry of the same provider.  A 400/401/404
+# is the request's own fault and retrying it can only burn budget.
+RETRYABLE_STATUSES = (0, 402, 429)
 
 PROVIDERS_SCHEMA = "free-model-aggregator-01/providers/v1"
 RATINGS_SCHEMA = "free-model-aggregator-01/ratings/v1"
@@ -52,7 +83,7 @@ ENV_URL = os.environ.get("MAKEFUN_ENV_URL", "").rstrip("/")
 PROMPT_FILE = os.environ.get("MAKEFUN_PROMPT_FILE", "")
 
 # ---------------------------------------------------------------------------
-# small helpers
+# small value helpers
 # ---------------------------------------------------------------------------
 
 
@@ -70,7 +101,12 @@ def str_of(v):
 
 
 def num_or_none(v):
+    """v as a finite number, else None (NaN/inf are not usable lengths)."""
     return v if isinstance(v, (int, float)) and v == v and abs(v) != float("inf") else None
+
+
+def num_or_zero(value):
+    return value if isinstance(value, (int, float)) and value == value else 0
 
 
 def bool_or_none(v):
@@ -81,8 +117,16 @@ def json_compact(value):
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 
 
+def safe_json_loads(text):
+    """json.loads, or None when the bytes are not a JSON document."""
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
 def text_of(content):
-    """Text of a string or of a block array's text blocks, joined with newline."""
+    """Text of a string, or of a block array's text blocks joined with newline."""
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
@@ -102,14 +146,11 @@ def string_list(v):
 
 
 def args_of(value):
-    """A tool call's arguments as an object."""
+    """A tool call's arguments as an object (string JSON is parsed, else {})."""
     if is_record(value):
         return value
     if isinstance(value, str) and value.strip():
-        try:
-            parsed = json.loads(value)
-        except Exception:
-            return {}
+        parsed = safe_json_loads(value)
         if is_record(parsed):
             return parsed
     return {}
@@ -123,12 +164,28 @@ def parse_data_url(url):
     return m.group(1) or "image/png", m.group(2)
 
 
+def tool_result_text(content):
+    """A tool result's content flattened to the string the next call carries."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text = text_of(content)
+        return text if text else json_compact(content)
+    if content is None:
+        return ""
+    return json_compact(content)
+
+
 # ---------------------------------------------------------------------------
-# the brief
+# the brief ($MAKEFUN_PROMPT_FILE)
+#
+# The brief is prose with JSON documents embedded in it, each carrying a
+# "schema" field.  We scan for top-level objects and keep the three we know.
 # ---------------------------------------------------------------------------
 
 
 def object_end(text, start):
+    """Index of the closing brace matching the object at `start`, or -1."""
     depth = 0
     in_string = False
     i = start
@@ -152,15 +209,13 @@ def object_end(text, start):
 
 
 def documents_in(text):
+    """Every top-level JSON object in `text` that carries a string schema."""
     out = []
     start = text.find("{")
     while start != -1:
         end = object_end(text, start)
         if end != -1:
-            try:
-                value = json.loads(text[start:end + 1])
-            except Exception:
-                value = None
+            value = safe_json_loads(text[start:end + 1])
             if is_record(value) and isinstance(value.get("schema"), str):
                 out.append(value)
         start = text.find("{", start + 1)
@@ -168,6 +223,8 @@ def documents_in(text):
 
 
 class Provider:
+    """One row of the brief's provider directory."""
+
     __slots__ = ("id", "name", "wire", "auth", "base", "key_env", "key", "index")
 
     def __init__(self, id_, name, wire, auth, base, key_env, key, index):
@@ -180,8 +237,12 @@ class Provider:
         self.key = key
         self.index = index
 
+    def __repr__(self):
+        return "Provider(%s, wire=%s)" % (self.id, self.wire)
+
 
 def provider_of(v, index):
+    """A brief provider row as a Provider, or None when it is not usable."""
     if not is_record(v):
         return None
     id_ = str_of(v.get("id"))
@@ -190,6 +251,8 @@ def provider_of(v, index):
         return None
     auth = v.get("auth")
     if auth not in ("bearer", "x-api-key", "x-goog-api-key", "none"):
+        # Unknown scheme: fall back to the most common one rather than
+        # refusing a provider the brief plainly lists.
         auth = "bearer"
     base = ""
     for key in ("path", "base_path", "base_url", "base"):
@@ -201,6 +264,7 @@ def provider_of(v, index):
 
 
 def rating_of(v):
+    """A quality-table row as a plain dict, or None when it names nothing."""
     if not is_record(v):
         return None
     model = str_of(v.get("model"))
@@ -220,6 +284,7 @@ def rating_of(v):
 
 
 def workload_request_of(v):
+    """A workload manifest row as a plain dict, or None when it has no id."""
     if not is_record(v):
         return None
     id_ = str_of(v.get("id"))
@@ -236,11 +301,25 @@ def workload_request_of(v):
 
 
 class Brief:
+    """The parsed brief: providers, the quality table, the workload manifest."""
+
     def __init__(self):
         self.providers = []
         self.ratings = None  # {"ratings": [...], "best": [...]}
+        self.rating_index = {}  # (provider_id, model_id) -> rating row
         self.workload = None  # {"manifest": [...]}
         self.error = None
+
+    def rating_row(self, provider_id, model_id):
+        """The quality-table row for one provider/model pair, or None."""
+        return self.rating_index.get((provider_id, model_id))
+
+
+def _first_doc(docs, schema, list_key):
+    for doc in docs:
+        if doc.get("schema") == schema and isinstance(doc.get(list_key), list):
+            return doc
+    return None
 
 
 def read_brief(path):
@@ -255,8 +334,7 @@ def read_brief(path):
         brief.error = "cannot read %s: %s" % (path, err)
         return brief
     docs = documents_in(text)
-    directory = next((d for d in docs if d.get("schema") == PROVIDERS_SCHEMA
-                      and isinstance(d.get("providers"), list)), None)
+    directory = _first_doc(docs, PROVIDERS_SCHEMA, "providers")
     if directory is None:
         brief.error = "the brief at %s holds no %s document" % (path, PROVIDERS_SCHEMA)
         return brief
@@ -264,8 +342,7 @@ def read_brief(path):
         p = provider_of(raw, i)
         if p is not None:
             brief.providers.append(p)
-    ratings_doc = next((d for d in docs if d.get("schema") == RATINGS_SCHEMA
-                        and isinstance(d.get("ratings"), list)), None)
+    ratings_doc = _first_doc(docs, RATINGS_SCHEMA, "ratings")
     if ratings_doc is not None:
         rows = [r for r in (rating_of(v) for v in ratings_doc["ratings"]) if r is not None]
         best = []
@@ -275,21 +352,26 @@ def read_brief(path):
                     best.append({"id": v["id"],
                                  "rating_milli": num_or_none(v.get("rating_milli")) or 0})
         brief.ratings = {"ratings": rows, "best": best}
-    workload_doc = next((d for d in docs if d.get("schema") == WORKLOAD_SCHEMA
-                         and isinstance(d.get("manifest"), list)), None)
+        brief.rating_index = {(r["provider"], r["model"]): r for r in rows}
+    workload_doc = _first_doc(docs, WORKLOAD_SCHEMA, "manifest")
     if workload_doc is not None:
         manifest = [w for w in (workload_request_of(v) for v in workload_doc["manifest"])
                     if w is not None]
         brief.workload = {"manifest": manifest}
     return brief
 
-
 # ---------------------------------------------------------------------------
 # providers: auth, probing, catalog
+#
+# Each provider is probed once, in its own wire, before registration.  The
+# catalog is built from the probes plus the sealed quality table: the table
+# is the authority on whether a model is free and how long its context is,
+# the probe is the authority on which models the provider actually lists.
 # ---------------------------------------------------------------------------
 
 
 def join_base(env_url, base):
+    """A provider's base as an absolute URL under the env's origin."""
     b = (base or "").strip()
     if re.match(r"^https?://", b, re.I):
         return b.rstrip("/")
@@ -300,6 +382,9 @@ def join_base(env_url, base):
 
 
 def auth_headers(auth, key):
+    """The provider's own auth header.  The wire does not decide the header:
+    an Anthropic-wire provider may still take a Bearer token, and a Gemini
+    one an x-goog-api-key.  A provider whose scheme is `none` takes no key."""
     if not key:
         return {}
     if auth == "bearer":
@@ -312,11 +397,18 @@ def auth_headers(auth, key):
 
 
 def http_request(method, url, headers=None, body=None, timeout=PROBE_TIMEOUT_S):
-    """One HTTP call. Returns (status, headers_dict, body_bytes) or (0, {}, b'')."""
+    """One HTTP call.  Returns (status, headers_dict, body_bytes).
+
+    Any transport failure is (0, {}, b'') -- the caller treats it exactly
+    like a refusal, so a dead route fails over instead of crashing the
+    request.  Only http(s) URLs with a hostname are attempted: anything else
+    (a relative path, a non-HTTP scheme, a host-less URL) is refused
+    outright, never fetched.
+    """
     parts = urllib.parse.urlparse(url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         return 0, {}, b""
-    host = parts.hostname or ""
+    host = parts.hostname
     port = parts.port or (443 if parts.scheme == "https" else 80)
     path = parts.path or "/"
     if parts.query:
@@ -339,6 +431,8 @@ def http_request(method, url, headers=None, body=None, timeout=PROBE_TIMEOUT_S):
 
 
 def zero_priced(v):
+    """True when a model's pricing object is all zeroes, False when any price
+    is non-zero, None when the model carries no pricing at all."""
     pricing = v.get("pricing") if is_record(v.get("pricing")) else None
     if pricing is None:
         return None
@@ -357,10 +451,18 @@ def zero_priced(v):
 
 
 def model_in(wire, v):
+    """One catalog-route model row as a plain dict, or None when it has no id.
+
+    Gemini names its models `models/<id>`; the other wires use `id` as-is.
+    Context length is read from whichever field the wire uses.  The `free`
+    flag comes from the row when present, else from an all-zero pricing
+    object, else None (the quality table then decides).
+    """
     if not is_record(v):
         return None
     if wire == "gemini":
-        id_ = str_of(v.get("name")).replace("models/", "", 1) if str_of(v.get("name")).startswith("models/") else str_of(v.get("name"))
+        raw = str_of(v.get("name"))
+        id_ = raw[len("models/"):] if raw.startswith("models/") else raw
     else:
         id_ = str_of(v.get("id"))
     if id_ == "":
@@ -385,6 +487,7 @@ def model_in(wire, v):
 
 
 def models_in(wire, body):
+    """The model rows of a catalog-route body (Gemini: `models`, else `data`)."""
     if not is_record(body):
         return []
     lst = body.get("models") if wire == "gemini" else body.get("data")
@@ -394,6 +497,8 @@ def models_in(wire, body):
 
 
 def probe_provider(env_url, provider):
+    """GET one provider's catalog route.  Returns a probe dict with `ok`,
+    the HTTP `status`, the parsed `models`, and an `error` string on failure."""
     base = join_base(env_url, provider.base)
     url = base + ("/v1beta/models" if provider.wire == "gemini" else "/v1/models")
     headers = {"accept": "application/json"}
@@ -404,31 +509,27 @@ def probe_provider(env_url, provider):
     if status < 200 or status >= 300:
         return {"provider": provider, "ok": False, "status": status, "models": [],
                 "error": "GET %s answered HTTP %s" % (url, status)}
-    try:
-        body = json.loads(data.decode("utf-8"))
-    except Exception as err:
+    body = safe_json_loads(data.decode("utf-8"))
+    if body is None:
         return {"provider": provider, "ok": False, "status": status, "models": [],
-                "error": "GET %s is not JSON: %s" % (url, err)}
+                "error": "GET %s is not JSON" % url}
     return {"provider": provider, "ok": True, "status": status,
             "models": models_in(provider.wire, body), "error": None}
 
 
-def rating_row(brief, provider_id, model_id):
-    if brief.ratings is None:
-        return None
-    for row in brief.ratings["ratings"]:
-        if row["provider"] == provider_id and row["model"] == model_id:
-            return row
-    return None
-
-
 def model_free(model, row):
+    """Whether a probed model may serve a request.  The quality table wins
+    when it has a row for the model; otherwise the probe's own flag does."""
     if row is not None:
         return row["free"]
     return model["free"] is True
 
 
 def capabilities_of(model, row):
+    """The capabilities a routing decision sees: context length from the
+    quality table when it has one, else the probe; tools/vision/json the
+    same way (the table's booleans are authoritative, the probe's are the
+    fallback)."""
     return {
         "context_length": (row["context_length"] if row is not None and row["context_length"] is not None
                            else model["context_length"]),
@@ -439,6 +540,7 @@ def capabilities_of(model, row):
 
 
 def meets_requirements(requires, caps):
+    """True when a model's capabilities cover a request's requirements."""
     if requires.get("tools") and caps.get("tools") is not True:
         return False
     if requires.get("vision") and caps.get("vision") is not True:
@@ -453,7 +555,12 @@ def meets_requirements(requires, caps):
 
 
 def build_catalog(probes, brief):
-    """The --list document and the register body's catalog: the same object."""
+    """The --list document and the register body's catalog: the same object.
+
+    One entry per probed provider (unreachable providers are left out), each
+    model's id deduplicated and sorted, with the free flag and context
+    length the quality table gives for it.
+    """
     providers = []
     for probe in probes:
         if not probe["ok"]:
@@ -464,8 +571,9 @@ def build_catalog(probes, brief):
             if model["id"] in seen:
                 continue
             seen.add(model["id"])
-            row = rating_row(brief, probe["provider"].id, model["id"])
-            ctx = row["context_length"] if row is not None and row["context_length"] is not None else model["context_length"]
+            row = brief.rating_row(probe["provider"].id, model["id"])
+            ctx = (row["context_length"] if row is not None and row["context_length"] is not None
+                   else model["context_length"])
             models.append({"id": model["id"], "free": model_free(model, row),
                            "context_length": ctx})
         providers.append({"id": probe["provider"].id, "base_url": probe["provider"].base,
@@ -476,12 +584,17 @@ def build_catalog(probes, brief):
 
 # ---------------------------------------------------------------------------
 # global trial state
+#
+# Built once by load_catalog() before the server starts listening; the
+# request handlers then only read it (plus the per-provider failure counters
+# and the manifest cursor, both guarded by the single handler lock).
 # ---------------------------------------------------------------------------
 
 BRIEF = read_brief(PROMPT_FILE)
 PROBES = []
 CATALOG = {"providers": []}
-# candidates: [{provider, model, rating, caps, wire}] for every free model
+# candidates: [{provider, model, rating, caps}] for every free model, in
+# probe order (brief order) -- the order GET /v1/models lists them in.
 CANDIDATES = []
 # per-provider runtime state: {"calls": int, "consec_fail": int}
 PROVIDER_STATE = {}
@@ -490,6 +603,7 @@ HANDLE_LOCK = threading.Lock()
 
 
 def load_catalog():
+    """Probe every provider, build the catalog and the candidate list."""
     global PROBES, CATALOG, CANDIDATES, PROVIDER_STATE
     if BRIEF.error is not None:
         log(BRIEF.error)
@@ -503,7 +617,7 @@ def load_catalog():
         if not probe["ok"]:
             continue
         for model in probe["models"]:
-            row = rating_row(BRIEF, probe["provider"].id, model["id"])
+            row = BRIEF.rating_row(probe["provider"].id, model["id"])
             if not model_free(model, row):
                 continue
             CANDIDATES.append({
@@ -518,7 +632,7 @@ def load_catalog():
 
 
 def served_models():
-    """Free models for GET /v1/models, deduplicated by id, brief order."""
+    """Free models for GET /v1/models, deduplicated by id, in brief order."""
     out = []
     seen = set()
     for cand in CANDIDATES:
@@ -550,10 +664,18 @@ def anthropic_error(type_, message):
 
 # ---------------------------------------------------------------------------
 # wire translation: requests
+#
+# The three wires carry the same request in different shapes.  Each
+# translator below preserves the strings the provider echoes back -- system
+# prompt, user text, images, tool names, max_tokens, stop sequences, JSON
+# mode -- exactly, because the scorer checks the echo against what the
+# client sent.  Shared pieces (tool declarations, image parts, generation
+# config) live in one helper each so the three translators cannot drift.
 # ---------------------------------------------------------------------------
 
 
 def stop_reason_of(finish):
+    """An OpenAI finish_reason as an Anthropic stop_reason."""
     if finish == "length":
         return "max_tokens"
     if finish in ("tool_calls", "function_call"):
@@ -564,6 +686,8 @@ def stop_reason_of(finish):
 
 
 def finish_reason_of(stop):
+    """An Anthropic stop_reason (or a Gemini finishReason) as an OpenAI
+    finish_reason."""
     if stop in ("max_tokens", "MAX_TOKENS"):
         return "length"
     if stop in ("tool_use", "tool_calls", "function_call"):
@@ -573,15 +697,7 @@ def finish_reason_of(stop):
     return "stop"
 
 
-def tool_result_text(content):
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        text = text_of(content)
-        return text if text else json_compact(content)
-    if content is None:
-        return ""
-    return json_compact(content)
+# --- shared pieces ---------------------------------------------------------
 
 
 def anthropic_image_part(block):
@@ -594,6 +710,162 @@ def anthropic_image_part(block):
     if source.get("type") == "url" and isinstance(source.get("url"), str):
         return {"type": "image_url", "image_url": {"url": source["url"]}}
     return None
+
+
+def openai_image_block(url):
+    """An OpenAI image_url part as an Anthropic image block."""
+    mime, data = parse_data_url(url)
+    if data is not None:
+        return {"type": "image",
+                "source": {"type": "base64", "media_type": mime or "image/png", "data": data}}
+    return {"type": "image", "source": {"type": "url", "url": url}}
+
+
+def gemini_image_part(url):
+    """An image URL as a Gemini part: inlineData for data URLs, fileData else."""
+    mime, data = parse_data_url(url)
+    if data is not None:
+        return {"inlineData": {"mimeType": mime or "image/png", "data": data}}
+    return {"fileData": {"fileUri": url}}
+
+
+def anthropic_image_to_gemini(block):
+    """An Anthropic image block as a Gemini part."""
+    source = block.get("source") if is_record(block.get("source")) else {}
+    if source.get("type") == "base64" and isinstance(source.get("data"), str):
+        return {"inlineData": {
+            "mimeType": source.get("media_type") if isinstance(source.get("media_type"), str) else "image/png",
+            "data": source["data"]}}
+    if source.get("type") == "url" and isinstance(source.get("url"), str):
+        return {"fileData": {"fileUri": source["url"]}}
+    return None
+
+
+def anthropic_tools_to_openai(tools):
+    """Anthropic tool declarations as OpenAI function tools."""
+    out = []
+    for raw in tools or []:
+        if not is_record(raw) or not isinstance(raw.get("name"), str):
+            continue
+        out.append({"type": "function",
+                    "function": {"name": raw["name"],
+                                 "description": str_of(raw.get("description")),
+                                 "parameters": raw.get("input_schema") if is_record(raw.get("input_schema"))
+                                 else {"type": "object", "properties": {}}}})
+    return out
+
+
+def openai_tools_to_anthropic(tools):
+    """OpenAI function tools as Anthropic tool declarations."""
+    out = []
+    for raw in tools or []:
+        if not is_record(raw) or not is_record(raw.get("function")):
+            continue
+        fn = raw["function"]
+        if not isinstance(fn.get("name"), str):
+            continue
+        out.append({"name": fn["name"], "description": str_of(fn.get("description")),
+                    "input_schema": fn.get("parameters") if is_record(fn.get("parameters"))
+                    else {"type": "object", "properties": {}}})
+    return out
+
+
+def tools_to_gemini_decls(tools, anthropic_style):
+    """Tool declarations as Gemini functionDeclarations.
+
+    `anthropic_style` selects the input shape: Anthropic tools carry
+    `name`/`input_schema` at the top level, OpenAI ones nest them under
+    `function` with `parameters`.
+    """
+    decls = []
+    for raw in tools or []:
+        if not is_record(raw):
+            continue
+        if anthropic_style:
+            if not isinstance(raw.get("name"), str):
+                continue
+            decls.append({"name": raw["name"], "description": str_of(raw.get("description")),
+                          "parameters": raw.get("input_schema") if is_record(raw.get("input_schema"))
+                          else {"type": "object", "properties": {}}})
+        else:
+            if not is_record(raw.get("function")):
+                continue
+            fn = raw["function"]
+            if not isinstance(fn.get("name"), str):
+                continue
+            decls.append({"name": fn["name"], "description": str_of(fn.get("description")),
+                          "parameters": fn.get("parameters") if is_record(fn.get("parameters"))
+                          else {"type": "object", "properties": {}}})
+    return decls
+
+
+def anthropic_tool_choice_to_openai(choice):
+    """An Anthropic tool_choice as an OpenAI tool_choice value (or None)."""
+    if not is_record(choice):
+        return None
+    if choice.get("type") == "auto":
+        return "auto"
+    if choice.get("type") == "any":
+        return "required"
+    if choice.get("type") == "none":
+        return "none"
+    if choice.get("type") == "tool" and isinstance(choice.get("name"), str):
+        return {"type": "function", "function": {"name": choice["name"]}}
+    return None
+
+
+def openai_tool_choice_to_anthropic(choice):
+    """An OpenAI tool_choice as an Anthropic tool_choice value (or None)."""
+    if choice == "auto":
+        return {"type": "auto"}
+    if choice == "required":
+        return {"type": "any"}
+    if choice == "none":
+        return {"type": "none"}
+    if is_record(choice) and choice.get("type") == "function" and is_record(choice.get("function")):
+        return {"type": "tool", "name": str_of(choice["function"].get("name"))}
+    return None
+
+
+def gemini_generation_config(body, max_tokens, stops, json_mode):
+    """The generationConfig for a Gemini call, from the client's own fields."""
+    config = {}
+    if max_tokens is not None:
+        config["maxOutputTokens"] = max_tokens
+    if stops:
+        config["stopSequences"] = stops
+    if isinstance(body.get("temperature"), (int, float)):
+        config["temperature"] = body["temperature"]
+    if isinstance(body.get("top_p"), (int, float)):
+        config["topP"] = body["top_p"]
+    if json_mode:
+        config["responseMimeType"] = "application/json"
+    return config
+
+
+def openai_max_tokens(body):
+    """max_tokens, falling back to max_completion_tokens, else None."""
+    max_tokens = num_or_none(body.get("max_tokens"))
+    if max_tokens is None:
+        max_tokens = num_or_none(body.get("max_completion_tokens"))
+    return max_tokens
+
+
+def openai_json_mode(body):
+    """True when an OpenAI request asks for JSON output."""
+    fmt = body.get("response_format") if is_record(body.get("response_format")) else {}
+    return fmt.get("type") in ("json_object", "json_schema")
+
+
+def copy_sampling(body, out):
+    """temperature/top_p, when the client set them, onto an outgoing body."""
+    if isinstance(body.get("temperature"), (int, float)):
+        out["temperature"] = body["temperature"]
+    if isinstance(body.get("top_p"), (int, float)):
+        out["top_p"] = body["top_p"]
+
+
+# --- Anthropic client -> OpenAI provider -----------------------------------
 
 
 def anthropic_to_openai(body, model):
@@ -649,47 +921,22 @@ def anthropic_to_openai(body, model):
     out = {"model": model, "messages": messages}
     if isinstance(body.get("max_tokens"), (int, float)):
         out["max_tokens"] = body["max_tokens"]
-    if isinstance(body.get("temperature"), (int, float)):
-        out["temperature"] = body["temperature"]
-    if isinstance(body.get("top_p"), (int, float)):
-        out["top_p"] = body["top_p"]
+    copy_sampling(body, out)
     if isinstance(body.get("stop_sequences"), list) and body["stop_sequences"]:
         out["stop"] = body["stop_sequences"]
-    if isinstance(body.get("tools"), list):
-        tools = []
-        for raw in body["tools"]:
-            if not is_record(raw) or not isinstance(raw.get("name"), str):
-                continue
-            tools.append({"type": "function",
-                          "function": {"name": raw["name"],
-                                       "description": str_of(raw.get("description")),
-                                       "parameters": raw.get("input_schema") if is_record(raw.get("input_schema"))
-                                       else {"type": "object", "properties": {}}}})
-        if tools:
-            out["tools"] = tools
-    choice = body.get("tool_choice")
-    if is_record(choice):
-        if choice.get("type") == "auto":
-            out["tool_choice"] = "auto"
-        elif choice.get("type") == "any":
-            out["tool_choice"] = "required"
-        elif choice.get("type") == "none":
-            out["tool_choice"] = "none"
-        elif choice.get("type") == "tool" and isinstance(choice.get("name"), str):
-            out["tool_choice"] = {"type": "function", "function": {"name": choice["name"]}}
+    tools = anthropic_tools_to_openai(body.get("tools"))
+    if tools:
+        out["tools"] = tools
+    choice = anthropic_tool_choice_to_openai(body.get("tool_choice"))
+    if choice is not None:
+        out["tool_choice"] = choice
     if body.get("stream") is True:
         out["stream"] = True
         out["stream_options"] = {"include_usage": True}
     return out
 
 
-def openai_image_block(url):
-    """An OpenAI image_url part as an Anthropic image block."""
-    mime, data = parse_data_url(url)
-    if data is not None:
-        return {"type": "image",
-                "source": {"type": "base64", "media_type": mime or "image/png", "data": data}}
-    return {"type": "image", "source": {"type": "url", "url": url}}
+# --- OpenAI client -> Anthropic provider -----------------------------------
 
 
 def openai_to_anthropic(body, model):
@@ -743,70 +990,30 @@ def openai_to_anthropic(body, model):
     out = {"model": model, "messages": messages}
     if system_parts:
         out["system"] = "\n".join(system_parts)
-    max_tokens = num_or_none(body.get("max_tokens"))
-    if max_tokens is None:
-        max_tokens = num_or_none(body.get("max_completion_tokens"))
+    max_tokens = openai_max_tokens(body)
     if max_tokens is not None:
         out["max_tokens"] = max_tokens
-    if isinstance(body.get("temperature"), (int, float)):
-        out["temperature"] = body["temperature"]
-    if isinstance(body.get("top_p"), (int, float)):
-        out["top_p"] = body["top_p"]
+    copy_sampling(body, out)
     stops = string_list(body.get("stop"))
     if stops:
         out["stop_sequences"] = stops
-    if isinstance(body.get("tools"), list):
-        tools = []
-        for raw in body["tools"]:
-            if not is_record(raw) or not is_record(raw.get("function")):
-                continue
-            fn = raw["function"]
-            if not isinstance(fn.get("name"), str):
-                continue
-            tools.append({"name": fn["name"], "description": str_of(fn.get("description")),
-                          "input_schema": fn.get("parameters") if is_record(fn.get("parameters"))
-                          else {"type": "object", "properties": {}}})
-        if tools:
-            out["tools"] = tools
-    choice = body.get("tool_choice")
-    if choice == "auto":
-        out["tool_choice"] = {"type": "auto"}
-    elif choice == "required":
-        out["tool_choice"] = {"type": "any"}
-    elif choice == "none":
-        out["tool_choice"] = {"type": "none"}
-    elif is_record(choice) and choice.get("type") == "function" and is_record(choice.get("function")):
-        out["tool_choice"] = {"type": "tool", "name": str_of(choice["function"].get("name"))}
+    tools = openai_tools_to_anthropic(body.get("tools"))
+    if tools:
+        out["tools"] = tools
+    choice = openai_tool_choice_to_anthropic(body.get("tool_choice"))
+    if choice is not None:
+        out["tool_choice"] = choice
     if body.get("stream") is True:
         out["stream"] = True
     return out
 
 
-def gemini_image_part(url):
-    """An image URL as a Gemini part: inlineData for data URLs, fileData else."""
-    mime, data = parse_data_url(url)
-    if data is not None:
-        return {"inlineData": {"mimeType": mime or "image/png", "data": data}}
-    return {"fileData": {"fileUri": url}}
+# --- either client -> Gemini provider --------------------------------------
 
 
-def _gemini_generation_config(body, max_tokens, stops, json_mode):
-    config = {}
-    if max_tokens is not None:
-        config["maxOutputTokens"] = max_tokens
-    if stops:
-        config["stopSequences"] = stops
-    if isinstance(body.get("temperature"), (int, float)):
-        config["temperature"] = body["temperature"]
-    if isinstance(body.get("top_p"), (int, float)):
-        config["topP"] = body["top_p"]
-    if json_mode:
-        config["responseMimeType"] = "application/json"
-    return config
-
-
-def openai_to_gemini(body, model):
-    """An OpenAI Chat Completions request as a Gemini generateContent request."""
+def openai_messages_to_gemini(body):
+    """An OpenAI message list as Gemini contents, plus the tool-call name
+    map (tool_call_id -> function name) the tool role needs to resolve."""
     system_parts = []
     contents = []
     tool_names = {}
@@ -853,36 +1060,11 @@ def openai_to_gemini(body, model):
                     elif block.get("type") == "image_url" and is_record(block.get("image_url")):
                         parts.append(gemini_image_part(str_of(block["image_url"].get("url"))))
             contents.append({"role": "user", "parts": parts})
-    out = {"contents": contents}
-    if system_parts:
-        out["systemInstruction"] = {"parts": [{"text": "\n".join(system_parts)}]}
-    if isinstance(body.get("tools"), list):
-        decls = []
-        for raw in body["tools"]:
-            if not is_record(raw) or not is_record(raw.get("function")):
-                continue
-            fn = raw["function"]
-            if not isinstance(fn.get("name"), str):
-                continue
-            decls.append({"name": fn["name"], "description": str_of(fn.get("description")),
-                          "parameters": fn.get("parameters") if is_record(fn.get("parameters"))
-                          else {"type": "object", "properties": {}}})
-        if decls:
-            out["tools"] = [{"functionDeclarations": decls}]
-    max_tokens = num_or_none(body.get("max_tokens"))
-    if max_tokens is None:
-        max_tokens = num_or_none(body.get("max_completion_tokens"))
-    fmt = body.get("response_format") if is_record(body.get("response_format")) else {}
-    json_mode = fmt.get("type") in ("json_object", "json_schema")
-    config = _gemini_generation_config(body, max_tokens, string_list(body.get("stop")), json_mode)
-    if config:
-        out["generationConfig"] = config
-    return out, model
+    return system_parts, contents
 
 
-def anthropic_to_gemini(body, model):
-    """An Anthropic Messages request as a Gemini generateContent request."""
-    system = text_of(body.get("system"))
+def anthropic_messages_to_gemini(body):
+    """An Anthropic message list as Gemini contents (system text separate)."""
     contents = []
     tool_names = {}
     for raw in body.get("messages") or []:
@@ -916,32 +1098,45 @@ def anthropic_to_gemini(body, model):
                     if block.get("type") == "text" and isinstance(block.get("text"), str):
                         parts.append({"text": block["text"]})
                     elif block.get("type") == "image":
-                        source = block.get("source") if is_record(block.get("source")) else {}
-                        if source.get("type") == "base64" and isinstance(source.get("data"), str):
-                            parts.append({"inlineData": {
-                                "mimeType": source.get("media_type") if isinstance(source.get("media_type"), str) else "image/png",
-                                "data": source["data"]}})
-                        elif source.get("type") == "url" and isinstance(source.get("url"), str):
-                            parts.append({"fileData": {"fileUri": source["url"]}})
+                        part = anthropic_image_to_gemini(block)
+                        if part is not None:
+                            parts.append(part)
                     elif block.get("type") == "tool_result":
                         name = tool_names.get(str_of(block.get("tool_use_id")), "")
                         parts.append({"functionResponse": {"name": name,
                                                           "response": {"content": tool_result_text(block.get("content"))}}})
             contents.append({"role": "user", "parts": parts})
+    return contents
+
+
+def openai_to_gemini(body, model):
+    """An OpenAI Chat Completions request as a Gemini generateContent request."""
+    system_parts, contents = openai_messages_to_gemini(body)
+    out = {"contents": contents}
+    if system_parts:
+        out["systemInstruction"] = {"parts": [{"text": "\n".join(system_parts)}]}
+    decls = tools_to_gemini_decls(body.get("tools"), anthropic_style=False)
+    if decls:
+        out["tools"] = [{"functionDeclarations": decls}]
+    config = gemini_generation_config(body, openai_max_tokens(body),
+                                      string_list(body.get("stop")),
+                                      openai_json_mode(body))
+    if config:
+        out["generationConfig"] = config
+    return out, model
+
+
+def anthropic_to_gemini(body, model):
+    """An Anthropic Messages request as a Gemini generateContent request."""
+    system = text_of(body.get("system"))
+    contents = anthropic_messages_to_gemini(body)
     out = {"contents": contents}
     if system:
         out["systemInstruction"] = {"parts": [{"text": system}]}
-    if isinstance(body.get("tools"), list):
-        decls = []
-        for raw in body["tools"]:
-            if not is_record(raw) or not isinstance(raw.get("name"), str):
-                continue
-            decls.append({"name": raw["name"], "description": str_of(raw.get("description")),
-                          "parameters": raw.get("input_schema") if is_record(raw.get("input_schema"))
-                          else {"type": "object", "properties": {}}})
-        if decls:
-            out["tools"] = [{"functionDeclarations": decls}]
-    config = _gemini_generation_config(
+    decls = tools_to_gemini_decls(body.get("tools"), anthropic_style=True)
+    if decls:
+        out["tools"] = [{"functionDeclarations": decls}]
+    config = gemini_generation_config(
         body, num_or_none(body.get("max_tokens")),
         string_list(body.get("stop_sequences")), False)
     if config:
@@ -950,14 +1145,16 @@ def anthropic_to_gemini(body, model):
 
 # ---------------------------------------------------------------------------
 # wire translation: responses
+#
+# JSON answers are rebuilt in the client's wire from the provider's answer;
+# same-wire answers pass through untouched (byte for byte).  SSE streams are
+# re-emitted event by event in the client's wire, carrying the provider's
+# text, tool-call arguments, stop reason and usage across.
 # ---------------------------------------------------------------------------
 
 
-def num_or_zero(value):
-    return value if isinstance(value, (int, float)) and value == value else 0
-
-
 def openai_json_response(model, text, finish_reason, input_tokens, output_tokens, tool_calls=None):
+    """A Chat Completions object for one answer."""
     message = {"role": "assistant", "content": text}
     if tool_calls:
         message["tool_calls"] = tool_calls
@@ -974,6 +1171,7 @@ def openai_json_response(model, text, finish_reason, input_tokens, output_tokens
 
 
 def anthropic_json_response(model, text, stop_reason, input_tokens, output_tokens, tool_blocks=None):
+    """An Anthropic Messages object for one answer."""
     content = []
     if text:
         content.append({"type": "text", "text": text})
@@ -993,12 +1191,8 @@ def anthropic_json_response(model, text, stop_reason, input_tokens, output_token
     }
 
 
-def openai_json_to_anthropic(body, model):
-    """A Chat Completions answer as an Anthropic Messages object."""
-    choices = body.get("choices") if isinstance(body.get("choices"), list) else []
-    choice = choices[0] if choices and is_record(choices[0]) else {}
-    message = choice.get("message") if is_record(choice.get("message")) else {}
-    text = message.get("content") if isinstance(message.get("content"), str) else text_of(message.get("content"))
+def openai_tool_calls_to_anthropic(message):
+    """An OpenAI message's tool_calls as Anthropic tool_use blocks."""
     tool_blocks = []
     for call in message.get("tool_calls") or []:
         if not is_record(call) or not is_record(call.get("function")):
@@ -1008,16 +1202,11 @@ def openai_json_to_anthropic(body, model):
                             "id": str_of(call.get("id")) or "toolu_unknown",
                             "name": str_of(fn.get("name")),
                             "input": args_of(fn.get("arguments"))})
-    usage = body.get("usage") if is_record(body.get("usage")) else {}
-    return anthropic_json_response(
-        model, text, stop_reason_of(choice.get("finish_reason")),
-        num_or_zero(usage.get("prompt_tokens")), num_or_zero(usage.get("completion_tokens")),
-        tool_blocks)
+    return tool_blocks
 
 
-def anthropic_json_to_openai(body, model):
-    """An Anthropic Messages answer as a Chat Completions object."""
-    content = body.get("content")
+def anthropic_blocks_to_openai(content):
+    """An Anthropic content list as (text, tool_calls) for an OpenAI message."""
     text = ""
     tool_calls = []
     if isinstance(content, list):
@@ -1033,6 +1222,25 @@ def anthropic_json_to_openai(body, model):
                     "function": {"name": str_of(block.get("name")),
                                  "arguments": json_compact(block.get("input") if is_record(block.get("input")) else {})},
                 })
+    return text, tool_calls
+
+
+def openai_json_to_anthropic(body, model):
+    """A Chat Completions answer as an Anthropic Messages object."""
+    choices = body.get("choices") if isinstance(body.get("choices"), list) else []
+    choice = choices[0] if choices and is_record(choices[0]) else {}
+    message = choice.get("message") if is_record(choice.get("message")) else {}
+    text = message.get("content") if isinstance(message.get("content"), str) else text_of(message.get("content"))
+    usage = body.get("usage") if is_record(body.get("usage")) else {}
+    return anthropic_json_response(
+        model, text, stop_reason_of(choice.get("finish_reason")),
+        num_or_zero(usage.get("prompt_tokens")), num_or_zero(usage.get("completion_tokens")),
+        openai_tool_calls_to_anthropic(message))
+
+
+def anthropic_json_to_openai(body, model):
+    """An Anthropic Messages answer as a Chat Completions object."""
+    text, tool_calls = anthropic_blocks_to_openai(body.get("content"))
     usage = body.get("usage") if is_record(body.get("usage")) else {}
     return openai_json_response(
         model, text, finish_reason_of(body.get("stop_reason")),
@@ -1056,6 +1264,10 @@ def gemini_text_and_usage(body):
             num_or_zero(meta.get("candidatesTokenCount")))
 
 
+def gemini_stop_reason(finish):
+    return {"STOP": "end_turn", "MAX_TOKENS": "max_tokens", "SAFETY": "refusal"}.get(finish, "end_turn")
+
+
 def gemini_json_to_openai(body, model):
     text, finish, input_tokens, output_tokens = gemini_text_and_usage(body)
     return openai_json_response(model, text, finish_reason_of(finish),
@@ -1064,14 +1276,15 @@ def gemini_json_to_openai(body, model):
 
 def gemini_json_to_anthropic(body, model):
     text, finish, input_tokens, output_tokens = gemini_text_and_usage(body)
-    stop = {"STOP": "end_turn", "MAX_TOKENS": "max_tokens", "SAFETY": "refusal"}.get(finish, "end_turn")
-    return anthropic_json_response(model, text, stop, input_tokens, output_tokens)
+    return anthropic_json_response(model, text, gemini_stop_reason(finish),
+                                   input_tokens, output_tokens)
 
 
 def provider_input_tokens(client_api, body):
-    """The provider's input-token count for this request, from its own formula:
-    1 + floor((len(system) + len(last user text) + len(tool names joined)) / 4).
-    The translations preserve those strings exactly, so this matches."""
+    """The provider's input-token count for this request, from its own
+    formula: 1 + floor((len(system) + len(last user text) + len(tool names
+    joined)) / 4).  The translations preserve those strings exactly, so
+    this matches the count the provider itself reports."""
     if client_api == "openai":
         system = "\n".join(text_of(m.get("content")) for m in body.get("messages") or []
                            if is_record(m) and m.get("role") == "system" and text_of(m.get("content")))
@@ -1103,6 +1316,7 @@ def provider_input_tokens(client_api, body):
 
 
 def sse_event(event, data):
+    """One SSE frame: `event: <name>` when named, then `data: <compact JSON>`."""
     text = json_compact(data)
     if event is None:
         return "data: %s\n\n" % text
@@ -1110,7 +1324,7 @@ def sse_event(event, data):
 
 
 def parse_sse_frames(text):
-    """[(event, data_string)] for one SSE body."""
+    """[(event, data_string)] for one SSE body, in order."""
     frames = []
     normalized = text.replace("\r\n", "\n")
     for frame in normalized.split("\n\n"):
@@ -1129,6 +1343,8 @@ def parse_sse_frames(text):
 
 
 def openai_chunk(model, delta, finish_reason=None, usage=None):
+    """One Chat Completions chunk.  A usage-only chunk carries no choices,
+    as the wire expects."""
     chunk = {"id": "chatcmpl-aggregator", "object": "chat.completion.chunk",
              "created": FIXED_CREATED, "model": model,
              "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]}
@@ -1136,6 +1352,15 @@ def openai_chunk(model, delta, finish_reason=None, usage=None):
         chunk["choices"] = []
         chunk["usage"] = usage
     return chunk
+
+
+def anthropic_message_start(model, input_tokens):
+    return sse_event("message_start", {
+        "type": "message_start",
+        "message": {"id": "msg_stream", "type": "message", "role": "assistant",
+                    "model": model, "content": [], "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": input_tokens, "output_tokens": 0}}})
 
 
 def openai_sse_to_anthropic(text, model, input_tokens):
@@ -1154,12 +1379,7 @@ def openai_sse_to_anthropic(text, model, input_tokens):
         if started:
             return []
         started = True
-        return [sse_event("message_start", {
-            "type": "message_start",
-            "message": {"id": "msg_stream", "type": "message", "role": "assistant",
-                        "model": model, "content": [], "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": {"input_tokens": input_tokens, "output_tokens": 0}}})]
+        return [anthropic_message_start(model, input_tokens)]
 
     def close_events():
         nonlocal text_index
@@ -1192,10 +1412,7 @@ def openai_sse_to_anthropic(text, model, input_tokens):
             out.extend(start_events())
             out.extend(finish_events(pending_stop or "end_turn"))
             continue
-        try:
-            chunk = json.loads(payload)
-        except Exception:
-            continue
+        chunk = safe_json_loads(payload)
         if not is_record(chunk):
             continue
         if is_record(chunk.get("usage")):
@@ -1268,10 +1485,7 @@ def anthropic_sse_to_openai(text, model):
     for event, payload in parse_sse_frames(text):
         if event is None:
             continue
-        try:
-            data = json.loads(payload)
-        except Exception:
-            continue
+        data = safe_json_loads(payload)
         if not is_record(data):
             continue
         if event == "message_start":
@@ -1307,6 +1521,33 @@ def anthropic_sse_to_openai(text, model):
     return "".join(out)
 
 
+def gemini_sse_frames(text):
+    """The parsed frames of a Gemini streamGenerateContent SSE body."""
+    frames = []
+    for _event, payload in parse_sse_frames(text):
+        frame = safe_json_loads(payload)
+        if is_record(frame):
+            frames.append(frame)
+    return frames
+
+
+def gemini_frame_text_and_finish(frame):
+    """(text_piece, finish_reason, input_tokens, output_tokens) of one frame."""
+    candidates = frame.get("candidates") if isinstance(frame.get("candidates"), list) else []
+    cand = candidates[0] if candidates and is_record(candidates[0]) else {}
+    content = cand.get("content") if is_record(cand.get("content")) else {}
+    piece = ""
+    if isinstance(content.get("parts"), list):
+        for part in content["parts"]:
+            if is_record(part) and isinstance(part.get("text"), str):
+                piece += part["text"]
+    meta = frame.get("usageMetadata") if is_record(frame.get("usageMetadata")) else {}
+    return (piece,
+            str_of(cand.get("finishReason")) if isinstance(cand.get("finishReason"), str) else None,
+            num_or_zero(meta.get("promptTokenCount")),
+            num_or_zero(meta.get("candidatesTokenCount")))
+
+
 def gemini_sse_to_openai(text, model):
     """A Gemini streamGenerateContent SSE stream as Chat Completions chunks."""
     out = []
@@ -1322,30 +1563,17 @@ def gemini_sse_to_openai(text, model):
         sent_role = True
         return [sse_event(None, openai_chunk(model, {"role": "assistant", "content": ""}))]
 
-    for _event, payload in parse_sse_frames(text):
-        try:
-            frame = json.loads(payload)
-        except Exception:
-            continue
-        if not is_record(frame):
-            continue
-        candidates = frame.get("candidates") if isinstance(frame.get("candidates"), list) else []
-        cand = candidates[0] if candidates and is_record(candidates[0]) else {}
-        content = cand.get("content") if is_record(cand.get("content")) else {}
-        piece = ""
-        if isinstance(content.get("parts"), list):
-            for part in content["parts"]:
-                if is_record(part) and isinstance(part.get("text"), str):
-                    piece += part["text"]
+    for frame in gemini_sse_frames(text):
+        piece, frame_finish, in_tok, out_tok = gemini_frame_text_and_finish(frame)
         if piece:
             out.extend(role_chunk())
             out.append(sse_event(None, openai_chunk(model, {"content": piece})))
-        if isinstance(cand.get("finishReason"), str):
-            finish = cand["finishReason"]
-        meta = frame.get("usageMetadata") if is_record(frame.get("usageMetadata")) else {}
-        if meta:
-            input_tokens = num_or_zero(meta.get("promptTokenCount"))
-            output_tokens = num_or_zero(meta.get("candidatesTokenCount"))
+        if frame_finish is not None:
+            finish = frame_finish
+        meta = frame.get("usageMetadata")
+        if is_record(meta) and meta:
+            input_tokens = in_tok
+            output_tokens = out_tok
     out.extend(role_chunk())
     out.append(sse_event(None, openai_chunk(model, {}, finish_reason_of(finish or "STOP"))))
     out.append(sse_event(None, openai_chunk(
@@ -1357,57 +1585,48 @@ def gemini_sse_to_openai(text, model):
 
 def gemini_sse_to_anthropic(text, model, input_tokens):
     """A Gemini streamGenerateContent SSE stream as the Anthropic event sequence."""
-    out = [sse_event("message_start", {
-        "type": "message_start",
-        "message": {"id": "msg_stream", "type": "message", "role": "assistant",
-                    "model": model, "content": [], "stop_reason": None,
-                    "stop_sequence": None,
-                    "usage": {"input_tokens": input_tokens, "output_tokens": 0}}}),
+    out = [anthropic_message_start(model, input_tokens),
            sse_event("content_block_start", {
                "type": "content_block_start", "index": 0,
                "content_block": {"type": "text", "text": ""}})]
     finish = "STOP"
     output_tokens = 0
-    for _event, payload in parse_sse_frames(text):
-        try:
-            frame = json.loads(payload)
-        except Exception:
-            continue
-        if not is_record(frame):
-            continue
-        candidates = frame.get("candidates") if isinstance(frame.get("candidates"), list) else []
-        cand = candidates[0] if candidates and is_record(candidates[0]) else {}
-        content = cand.get("content") if is_record(cand.get("content")) else {}
-        piece = ""
-        if isinstance(content.get("parts"), list):
-            for part in content["parts"]:
-                if is_record(part) and isinstance(part.get("text"), str):
-                    piece += part["text"]
+    for frame in gemini_sse_frames(text):
+        piece, frame_finish, _in_tok, out_tok = gemini_frame_text_and_finish(frame)
         if piece:
             out.append(sse_event("content_block_delta", {
                 "type": "content_block_delta", "index": 0,
                 "delta": {"type": "text_delta", "text": piece}}))
-        if isinstance(cand.get("finishReason"), str):
-            finish = cand["finishReason"]
-        meta = frame.get("usageMetadata") if is_record(frame.get("usageMetadata")) else {}
-        if meta:
-            output_tokens = num_or_zero(meta.get("candidatesTokenCount"))
-    stop = {"STOP": "end_turn", "MAX_TOKENS": "max_tokens", "SAFETY": "refusal"}.get(finish, "end_turn")
+        if frame_finish is not None:
+            finish = frame_finish
+        if is_record(frame.get("usageMetadata")):
+            output_tokens = out_tok
     out.append(sse_event("content_block_stop", {"type": "content_block_stop", "index": 0}))
     out.append(sse_event("message_delta", {
         "type": "message_delta",
-        "delta": {"stop_reason": stop, "stop_sequence": None},
+        "delta": {"stop_reason": gemini_stop_reason(finish), "stop_sequence": None},
         "usage": {"output_tokens": output_tokens}}))
     out.append(sse_event("message_stop", {"type": "message_stop"}))
     return "".join(out)
 
 # ---------------------------------------------------------------------------
 # routing and serving
+#
+# One client request is served by one provider call, failing over across
+# providers until one answers.  The loop is deterministic: candidates are
+# ranked by effective score (rating minus the failure penalty), ties break
+# on the provider's brief order and then the model id, and nothing depends
+# on timing or randomness.
 # ---------------------------------------------------------------------------
 
 
 def requirements_for(body, client_api):
-    """The manifest's row by arrival order, else requirements read off the body."""
+    """The manifest's row for this request, by arrival order.
+
+    The manifest is the authority while it lasts; once it runs out (or the
+    brief carried none), requirements are read off the request body itself.
+    The cursor advances once per request either way.
+    """
     global MANIFEST_INDEX
     manifest = BRIEF.workload["manifest"] if BRIEF.workload is not None else []
     entry = manifest[MANIFEST_INDEX] if MANIFEST_INDEX < len(manifest) else None
@@ -1418,68 +1637,65 @@ def requirements_for(body, client_api):
 
 
 def requirements_from_body(body, client_api):
-    if client_api == "openai":
-        vision = False
-        for m in body.get("messages") or []:
-            if not is_record(m) or not isinstance(m.get("content"), list):
-                continue
-            for block in m["content"]:
-                if is_record(block) and block.get("type") in ("image", "image_url"):
-                    vision = True
-        fmt = body.get("response_format") if is_record(body.get("response_format")) else {}
-        return {"tools": isinstance(body.get("tools"), list) and len(body["tools"]) > 0,
-                "vision": vision,
-                "json": fmt.get("type") in ("json_object", "json_schema")}
+    """Requirements read off a request body (used past the manifest's end)."""
+    tools = isinstance(body.get("tools"), list) and len(body["tools"]) > 0
     vision = False
     for m in body.get("messages") or []:
         if not is_record(m) or not isinstance(m.get("content"), list):
             continue
         for block in m["content"]:
-            if is_record(block) and block.get("type") == "image":
+            if not is_record(block):
+                continue
+            if client_api == "openai" and block.get("type") in ("image", "image_url"):
                 vision = True
-    return {"tools": isinstance(body.get("tools"), list) and len(body["tools"]) > 0,
-            "vision": vision, "json": False}
-
-
-def is_json_mode(client_api, body):
-    if client_api != "openai":
-        return False
-    fmt = body.get("response_format") if is_record(body.get("response_format")) else {}
-    return fmt.get("type") in ("json_object", "json_schema")
+            elif client_api != "openai" and block.get("type") == "image":
+                vision = True
+    return {"tools": tools, "vision": vision,
+            "json": openai_json_mode(body) if client_api == "openai" else False}
 
 
 def candidate_score(cand):
-    state = PROVIDER_STATE[cand["provider"].id]
-    fails = state["consec_fail"]
-    # A single refusal is usually one scheduled fail call, not a dead provider:
-    # a small penalty keeps the best model first, while two consecutive
-    # refusals near-exclude the provider (outage or spent budget).
-    score = cand["rating"] - 5 * fails
-    if fails >= 2:
-        score -= 100000
+    """A candidate's effective score: rating, less FAILURE_PENALTY per
+    consecutive failure of its provider, less FAILURE_EXCLUSION once the
+    provider has failed FAILURE_EXCLUSION_AFTER times in a row."""
+    fails = PROVIDER_STATE[cand["provider"].id]["consec_fail"]
+    score = cand["rating"] - FAILURE_PENALTY * fails
+    if fails >= FAILURE_EXCLUSION_AFTER:
+        score -= FAILURE_EXCLUSION
     return score
 
 
-def pick_candidate(requires, client_api, body, tried_providers):
-    """Best not-yet-tried provider for this request, with its best model."""
-    json_mode = is_json_mode(client_api, body)
+def rank_key(cand):
+    """Sort key for candidates: best effective score first, then the
+    provider's brief order, then the model id -- fully deterministic."""
+    return (-candidate_score(cand), cand["provider"].index, cand["model"])
+
+
+def eligible_candidates(requires, client_api, body, tried_providers=None):
+    """Free candidates meeting the request, one (the best-rated) per
+    provider, in rank order.  JSON-mode requests from an OpenAI client are
+    never sent to an Anthropic-wire provider: it cannot carry
+    `response_format`, so the echo would come back without JSON mode and
+    lose the request."""
+    tried = tried_providers if tried_providers is not None else set()
+    json_mode = openai_json_mode(body) if client_api == "openai" else False
     best_per_provider = {}
     for cand in CANDIDATES:
         if json_mode and cand["provider"].wire == "anthropic":
-            # An Anthropic-wire provider cannot carry response_format: it would
-            # echo json_mode absent and lose the request.
             continue
         if not meets_requirements(requires, cand["caps"]):
             continue
         pid = cand["provider"].id
         if pid not in best_per_provider or cand["rating"] > best_per_provider[pid]["rating"]:
             best_per_provider[pid] = cand
-    ranked = sorted(best_per_provider.values(),
-                    key=lambda c: (-candidate_score(c), c["provider"].index, c["model"]))
-    for cand in ranked:
-        if cand["provider"].id not in tried_providers:
-            return cand
-    return None
+    return sorted((c for c in best_per_provider.values() if c["provider"].id not in tried),
+                  key=rank_key)
+
+
+def pick_candidate(requires, client_api, body, tried_providers):
+    """Best not-yet-tried provider for this request, with its best model."""
+    ranked = eligible_candidates(requires, client_api, body, tried_providers)
+    return ranked[0] if ranked else None
 
 
 def build_upstream(cand, client_api, body, stream):
@@ -1500,8 +1716,7 @@ def build_upstream(cand, client_api, body, stream):
             payload = anthropic_to_openai(body, cand["model"])
         return base + "/v1/chat/completions", headers, json_compact(payload).encode("utf-8")
     if provider.wire == "anthropic":
-        if provider.wire == "anthropic":
-            headers["anthropic-version"] = ANTHROPIC_VERSION
+        headers["anthropic-version"] = ANTHROPIC_VERSION
         if client_api == "anthropic":
             upstream = dict(body)
             upstream["model"] = cand["model"]
@@ -1509,22 +1724,23 @@ def build_upstream(cand, client_api, body, stream):
         else:
             payload = openai_to_anthropic(body, cand["model"])
         return base + "/v1/messages", headers, json_compact(payload).encode("utf-8")
-    # gemini wire
+    # Gemini wire: :generateContent, or :streamGenerateContent with ?alt=sse.
     if client_api == "openai":
         payload, _model = openai_to_gemini(body, cand["model"])
     else:
         payload, _model = anthropic_to_gemini(body, cand["model"])
+    quoted = urllib.parse.quote(cand["model"], safe="")
     if stream:
-        url = "%s/v1beta/models/%s:streamGenerateContent?alt=sse" % (
-            base, urllib.parse.quote(cand["model"], safe=""))
+        url = "%s/v1beta/models/%s:streamGenerateContent?alt=sse" % (base, quoted)
     else:
-        url = "%s/v1beta/models/%s:generateContent" % (
-            base, urllib.parse.quote(cand["model"], safe=""))
+        url = "%s/v1beta/models/%s:generateContent" % (base, quoted)
     return url, headers, json_compact(payload).encode("utf-8")
 
 
 def translate_response(cand, client_api, body, stream, status, data):
-    """(ok, content_type, body_bytes): the provider's answer in the client's wire."""
+    """(ok, content_type, body_bytes): the provider's answer in the client's
+    wire.  Same-wire answers pass through untouched; cross-wire answers are
+    rebuilt from the provider's fields."""
     provider = cand["provider"]
     model = cand["model"]
     if stream:
@@ -1539,7 +1755,6 @@ def translate_response(cand, client_api, body, stream, status, data):
                 if client_api == "anthropic":
                     return True, "text/event-stream", data
                 return True, "text/event-stream", anthropic_sse_to_openai(text, model).encode("utf-8")
-            # gemini wire
             if client_api == "openai":
                 return True, "text/event-stream", gemini_sse_to_openai(text, model).encode("utf-8")
             return True, "text/event-stream", gemini_sse_to_anthropic(
@@ -1547,10 +1762,7 @@ def translate_response(cand, client_api, body, stream, status, data):
         except Exception as err:
             log("stream translation failed for %s/%s: %s" % (provider.id, model, err))
             return False, None, None
-    try:
-        answer = json.loads(data.decode("utf-8"))
-    except Exception:
-        return False, None, None
+    answer = safe_json_loads(data.decode("utf-8"))
     if not is_record(answer):
         return False, None, None
     try:
@@ -1575,32 +1787,23 @@ def translate_response(cand, client_api, body, stream, status, data):
 
 
 def best_untried_score(requires, client_api, body, tried_providers):
-    """Best effective score among candidates on providers not yet tried, or None."""
-    json_mode = is_json_mode(client_api, body)
-    best = None
-    for cand in CANDIDATES:
-        if cand["provider"].id in tried_providers:
-            continue
-        if json_mode and cand["provider"].wire == "anthropic":
-            continue
-        if not meets_requirements(requires, cand["caps"]):
-            continue
-        score = candidate_score(cand)
-        if best is None or score > best:
-            best = score
-    return best
+    """Best effective score among candidates on providers not yet tried for
+    this request, or None when every eligible provider has been tried."""
+    ranked = eligible_candidates(requires, client_api, body, tried_providers)
+    return candidate_score(ranked[0]) if ranked else None
 
 
 def serve(client_api, body):
-    """Answer one client request. Returns (status, content_type, body_bytes)."""
+    """Answer one client request.  Returns (status, content_type, body_bytes)."""
     stream = body.get("stream") is True
     requires = requirements_for(body, client_api)
     tried_providers = set()
     retried_providers = set()
 
     def try_once(cand):
-        """One call to one provider. Returns (kind, status, content_type, out):
-        kind 'ok', 'refused' (HTTP error) or 'bad' (unusable 200 bytes)."""
+        """One call to one provider.  Returns (kind, status, content_type, out)
+        with kind 'ok', 'refused' (an HTTP error) or 'bad' (an unusable 200
+        body).  The provider's failure counter is updated either way."""
         provider = cand["provider"]
         state = PROVIDER_STATE[provider.id]
         url, headers, payload = build_upstream(cand, client_api, body, stream)
@@ -1622,32 +1825,40 @@ def serve(client_api, body):
     def retry_worth_it(cand, status):
         """A refusal is usually one scheduled fail call: if this provider's
         model still beats every untried alternative, spend one retry on its
-        next call before moving on. Never retry a 400/401/404."""
+        next call before moving on.  Never retry a 400/401/404, and never
+        retry the same provider twice for one request."""
         if cand["provider"].id in retried_providers:
             return False
-        if not (status == 0 or status == 402 or status == 429 or status >= 500):
+        if status not in RETRYABLE_STATUSES and status < 500:
             return False
         best_alt = best_untried_score(requires, client_api, body, tried_providers)
         return best_alt is None or cand["rating"] > best_alt
+
+    def fallback_candidate():
+        """Best tried-but-not-retried provider for this request, or None.
+        Used only once every eligible provider has been tried and refused."""
+        json_mode = openai_json_mode(body) if client_api == "openai" else False
+        remaining = [c for c in CANDIDATES
+                     if c["provider"].id in tried_providers
+                     and c["provider"].id not in retried_providers
+                     and meets_requirements(requires, c["caps"])
+                     and not (json_mode and c["provider"].wire == "anthropic")]
+        if not remaining:
+            return None
+        remaining.sort(key=rank_key)
+        return remaining[0]
 
     while True:
         cand = pick_candidate(requires, client_api, body, tried_providers)
         if cand is None:
             # No untried provider left: one retry of the best tried provider
             # that has not been retried yet, else the request is unservable.
-            json_mode = is_json_mode(client_api, body)
-            remaining = [c for c in CANDIDATES
-                         if c["provider"].id in tried_providers
-                         and c["provider"].id not in retried_providers
-                         and meets_requirements(requires, c["caps"])
-                         and not (json_mode and c["provider"].wire == "anthropic")]
-            if not remaining:
+            cand = fallback_candidate()
+            if cand is None:
                 error = (anthropic_error("overloaded_error", "no free model meets this request")
                          if client_api == "anthropic"
                          else openai_error("no free model meets this request", "no_free_model"))
                 return 503, "application/json", json_compact(error).encode("utf-8")
-            remaining.sort(key=lambda c: (-candidate_score(c), c["provider"].index, c["model"]))
-            cand = remaining[0]
             retried_providers.add(cand["provider"].id)
         provider = cand["provider"]
         tried_providers.add(provider.id)
@@ -1665,6 +1876,11 @@ def serve(client_api, body):
 
 # ---------------------------------------------------------------------------
 # HTTP server
+#
+# One process-wide lock serializes request handling: the env's client sends
+# requests one at a time, and serial handling keeps the manifest cursor,
+# the failure counters and the provider-call order deterministic -- and
+# keeps us clear of the one-call-at-a-time provider limit.
 # ---------------------------------------------------------------------------
 
 
@@ -1711,6 +1927,9 @@ class Handler(BaseHTTPRequestHandler):
     def _do_get(self):
         path = urllib.parse.urlparse(self.path).path
         if path == "/v1/models":
+            # The wire is named by the auth header, not the path: a Bearer
+            # request gets the OpenAI list, an x-api-key request the
+            # Anthropic one.
             models = served_models()
             if isinstance(self.headers.get("x-api-key"), str):
                 self._send(200, "application/json",
@@ -1745,12 +1964,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._error("openai", 404, "not_found", "no route POST %s" % path)
             return
-        try:
-            body = json.loads(raw.decode("utf-8"))
-        except Exception:
-            self._error(wire, 400, "invalid_request_error",
-                        "the request body is not one JSON object")
-            return
+        body = safe_json_loads(raw.decode("utf-8"))
         if not is_record(body):
             self._error(wire, 400, "invalid_request_error",
                         "the request body is not one JSON object")
@@ -1765,34 +1979,32 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def register(port):
+    """POST the catalog to the env until it answers 200 (up to
+    REGISTER_ATTEMPTS tries).  The env's reply names the request count."""
     body = json_compact({"protocol_version": PROTOCOL_VERSION, "port": port,
                          "catalog": CATALOG}).encode("utf-8")
-    for attempt in range(60):
+    for attempt in range(REGISTER_ATTEMPTS):
         status, _hdrs, data = http_request(
             "POST", ENV_URL + "/register",
             headers={"content-type": "application/json"}, body=body, timeout=5)
         if status == 200:
-            try:
-                reply = json.loads(data.decode("utf-8"))
-            except Exception:
-                reply = {}
+            reply = safe_json_loads(data.decode("utf-8"))
             if is_record(reply) and isinstance(reply.get("requests"), int):
                 log("registered: the workload holds %d requests" % reply["requests"])
             return
         if attempt % 10 == 9:
             log("register attempt %d answered HTTP %s; retrying" % (attempt + 1, status))
-        threading.Event().wait(0.5)
+        threading.Event().wait(REGISTER_RETRY_WAIT_S)
     raise RuntimeError("POST %s/register never answered 200" % ENV_URL)
 
 
 def poll_work(server, done_event):
+    """Watch GET /work until it says done, then stop the server.  Runs on
+    its own thread so serve_forever() keeps answering in the meantime."""
     while not done_event.is_set():
         status, _hdrs, data = http_request("GET", ENV_URL + "/work", timeout=2)
         if status == 200:
-            try:
-                work = json.loads(data.decode("utf-8"))
-            except Exception:
-                work = {}
+            work = safe_json_loads(data.decode("utf-8"))
             if is_record(work) and work.get("done") is True:
                 done_event.set()
                 server.shutdown()

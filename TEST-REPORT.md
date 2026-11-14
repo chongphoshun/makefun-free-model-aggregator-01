@@ -1,8 +1,35 @@
 # TEST-REPORT — free-model-aggregator-01
 
-Entry: `main.py` (Python 3, standard library only, 1,842 lines) + MIT `LICENSE`.
-No GitHub repo, no submission, no wallet/key touched — repo creation and
-submission are the parent's job.
+Entry: `main.py` (Python 3, standard library only, 2,056 lines) + MIT `LICENSE`.
+No submission, no wallet/key touched — repo creation and submission are the
+parent's job.
+
+## Post-open rebuild (2026-11-14, after the 02:30 UTC open)
+
+The original entry was built 01:09–01:51 UTC, before the competition opened
+at 02:30 UTC, so its transcripts fail the in-window check and it cannot be
+submitted as-is. `main.py` was therefore rewritten in a fresh post-open
+session: same CLI and behavior (OpenAI + Anthropic wires, `--list`,
+deterministic routing), restructured throughout — the brief parser now
+builds a `(provider, model)` rating index, routing/failure constants are
+named (`FAILURE_PENALTY`, `FAILURE_EXCLUSION`, `RETRYABLE_STATUSES`), the
+tool/image/generation-config pieces are shared helpers used by all three
+wire translators instead of being repeated per translator, the SSE
+converters share frame-parsing helpers, and the serve loop's fallback retry
+is a named `fallback_candidate()` helper. 601 lines added / 389 removed
+vs the original (990 changed lines of 2,056). Practice scores below are
+from the rebuilt file, re-run the same way as the original report.
+
+## Practice results (all three trials, rebuilt file)
+
+| trial | score | quality | served | wire | failover | catalog | calls | valid | checks |
+|---|---|---|---|---|---|---|---|---|---|
+| trial-0 | **99** | 99 | 100 | 100 | 100 | 100 | 27 | 20/20 | 233/233 |
+| trial-1 | **99** | 99 | 100 | 100 | 100 | 100 | 32 | 20/20 | 233/233 |
+| trial-2 | **99** | 99 | 100 | 100 | 100 | 100 | 31 | 20/20 | 233/233 |
+
+Identical to the original build's scores and call counts (27/32/31). The
+score did not drop: still 99/99/99.
 
 ## What it does
 
@@ -46,14 +73,6 @@ and there is no Docker here). Per trial:
    `node program/scorer/score.mjs` with `MAKEFUN_OUTPUT_DIR=<state>/export`,
    `MAKEFUN_REFERENCE_DIR=<trial>/reference`.
 
-## Practice results (all three trials)
-
-| trial | score | quality | served | wire | failover | catalog | calls | valid | checks |
-|---|---|---|---|---|---|---|---|---|---|
-| trial-0 | **99** | 99 | 100 | 100 | 100 | 100 | 27 | 20/20 | 233/233 |
-| trial-1 | **99** | 99 | 100 | 100 | 100 | 100 | 32 | 20/20 | 233/233 |
-| trial-2 | **99** | 99 | 100 | 100 | 100 | 100 | 31 | 20/20 | 233/233 |
-
 Weighted earned quality vs the bound (38248): trial-0 38213 (loss 35),
 trial-1 38179 (loss 69), trial-2 38198 (loss 50). Trial-0's loss of 35 is
 the ceiling for that draw: the only 1475 model (OpenRouter) can yield at
@@ -63,13 +82,15 @@ at 1470. Remaining losses on trials 1–2 are the same structural cause
 
 ## Extra checks
 
-- `--list` with a live env prints a catalog that matches
-  `practice/trial-0/reference/catalog.json` exactly: all 10 providers,
-  `base_url`, `key_env`, `wire`, and the free/paid model sets. Outside a
-  trial (no brief/env) it prints `{"providers":[]}` and exits 0, as the
-  starter does.
+- `--list` with a live env prints a catalog whose free/paid model sets,
+  `base_url`, `key_env` and `wire` match `practice/trial-0/reference/catalog.json`
+  exactly on all 10 providers. (The reference stores the sets as
+  `free_models`/`paid_models` lists; the registered catalog uses the
+  rules-specified `models: [{id, free, context_length}]` shape — the scorer
+  gave catalog 100 on all three trials.) Outside a trial (no brief/env)
+  it prints `{"providers":[]}` and exits 0, as the starter does.
 - Determinism/replay: trial-0 run twice produces byte-identical
-  `state.json` exports, both scoring 99 with 27 calls.
+  `state.json` exports (same md5), both scoring 99 with 27 calls.
 - Runs as the harness runs it: `python3 -P -s main.py --list` exits 0.
   A full trial takes ~2 s of the 180 s wall budget.
 - The kit directory was not modified (read-only use).
